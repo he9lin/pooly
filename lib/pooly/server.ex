@@ -32,6 +32,7 @@ defmodule Pooly.Server do
   #############
 
   def init([sup, pool_config]) when is_pid(sup) do
+    Process.flag(:trap_exit, true)
     monitors = :ets.new(:monitors, [:private])
     init(pool_config, %State{sup: sup, monitors: monitors})
   end
@@ -59,6 +60,37 @@ defmodule Pooly.Server do
      {:ok, worker_sup} = Supervisor.start_child(sup, supervisor_spec(mfa))
      workers = prepopulate(size, worker_sup)
      {:noreply, %{state | worker_sup: worker_sup, workers: workers}}
+  end
+
+  # When a consumer process goes down, we match the reference in the monitors
+  # ETS table, delete the monitor, and add back the worker into the state.
+  def handle_info({:DOWN, ref, _, _, _}, state = %{monitors: monitors, workers: workers}) do
+    case :ets.match(monitors, {:"$1", ref}) do
+      [[pid]] ->
+        true = :ets.delete(monitors, pid)
+        new_state = %{state | workers: [pid|workers]}
+        {:noreply, new_state}
+      [[]] ->
+        {:noreply, state}
+    end
+  end
+
+  # When a worker process exits unexpectedly, its entry is looked up in the
+  # monitors ETS table. If an entry doesn't exist, nothing needs to be done.
+  # Otherwise, the consumer process is no longer monitored, and its entry is
+  # removed from the monitors table. Finally, a new worker is created and added
+  # back into the workers field of the server state.
+  def handle_info({:EXIT, pid, _reason},
+      state = %{monitors: monitors, workers: workers, worker_sup: worker_sup}) do
+    case :ets.lookup(monitors, pid) do
+      [{pid, ref}] ->
+        true = Process.demonitor(ref)
+        true = :ets.delete(monitors, pid)
+        new_state = %{state | workers: [new_worker(worker_sup)|workers]}
+        {:noreply, new_state}
+      [[]] ->
+        {:noreply, state}
+    end
   end
 
   def handle_call(:checkout, {from_pid, _ref}, %{workers: workers, monitors: monitors} = state) do
@@ -90,6 +122,7 @@ defmodule Pooly.Server do
   #####################
   # Private Functions #
   #####################
+
   defp supervisor_spec(mfa) do
     opts = [restart: :temporary]
     supervisor(Pooly.WorkerSupervisor, [mfa], opts)
@@ -102,10 +135,10 @@ defmodule Pooly.Server do
     workers
   end
   defp prepopulate(size, sup, workers) do
-    prepopulate(size-1, sup, [new_worker(sup) | workers]) #1
+    prepopulate(size-1, sup, [new_worker(sup) | workers])
   end
   defp new_worker(sup) do
-    {:ok, worker} = Supervisor.start_child(sup, [[]]) #2
+    {:ok, worker} = Supervisor.start_child(sup, [[]])
     worker
   end
 end
